@@ -328,55 +328,6 @@ Ten en cuenta que `errores.log` se sobrescribe al inicio de cada
 sesion, por lo que conviene compartirlo inmediatamente despues de que
 ocurra el problema.
 
-
-## Notas tecnicas
-
-### UN Digital Library
-- Funciona sobre Invenio, plataforma de repositorios desarrollada por
-  el CERN.
-- Requiere Playwright (navegador Chromium en modo headless) para
-  evitar el rechazo de clientes HTTP planos por parte del servidor.
-- Como respaldo para enriquecer metadatos de autor y fecha cuando el
-  HTML no los expone, el scraper consulta el endpoint MARCXML
-  (`/record/{recid}/export/xm`) usando `requests`.
-- Permite hasta 50 registros por pagina de busqueda.
-
-### ILO Labordoc
-- Funciona sobre Ex Libris Primo VE, aplicacion construida con Angular.
-- Requiere Playwright porque la pagina carga sus resultados de manera
-  dinamica mediante JavaScript.
-- El camino principal para resolver los enlaces de descarga es una
-  cadena de tres llamadas a la API REST interna de Primo VE:
-  1. Obtencion de un token JWT de invitado (vigencia aproximada de
-     24 horas, almacenado en cache para reutilizarlo).
-  2. Consulta del endpoint de entrega electronica `edelivery` para
-     identificar los servicios digitales del documento.
-  3. Resolucion final mediante `representationInfo`, que devuelve una
-     URL S3 firmada con vigencia aproximada de una hora.
-- Si la cadena REST falla, el sistema activa un mecanismo de respaldo
-  basado en navegacion Playwright sobre la pagina de detalle del
-  documento.
-- Presenta 10 resultados por pagina en su interfaz.
-
-### Lista negra de URLs
-Ambos scrapers mantienen una lista de patrones de URL que se descartan
-automaticamente al evaluar las opciones de descarga de cada documento.
-Incluye miniaturas de portada, recursos estaticos del sitio (.css, .js,
-.png, etc.), redes sociales, sistemas de seguimiento analitico y
-endpoints internos protegidos (como `/intranet/` en Labordoc, que
-devuelve sistematicamente error 403). La lista se mantiene como un
-conjunto explicito facilmente ampliable sin necesidad de modificar la
-logica central de extraccion.
-
-### Limites y uso responsable
-- El programa incluye pausas entre solicitudes para no sobrecargar los
-  servidores.
-- El limite maximo por sesion esta fijado en 100 documentos. Si se
-  ingresa un valor mayor, el sistema lo reduce silenciosamente a 100.
-- Estos repositorios son recursos publicos; usarlos con
-  responsabilidad.
-
-
 ## Agregar nuevas fuentes
 
 Consulta las instrucciones detalladas al final de `main.py` en la
@@ -417,7 +368,7 @@ comilla), el programa mostrara un mensaje de error claro indicando que
 linea tiene el problema, y seguira funcionando con valores por defecto.
 
 
-## Como ampliar el rango de fechas (por ejemplo, para usar el programa en 2027)
+## Como ampliar el rango de fechas
 
 El programa valida que las fechas ingresadas esten dentro de un rango
 permitido. Por defecto, la fecha maxima es 2026. Si necesitas buscar
