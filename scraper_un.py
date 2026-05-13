@@ -524,6 +524,142 @@ class UNDigitalLibraryScraper(BaseScraper):
             return True
         return any(ind.lower() in html_lower for ind in indicadores_vacio[:3])
 
+    # ── Extraccion via MARCXML ──────────────────────────────────────────
+    # Invenio expone cada registro en MARCXML mediante el endpoint
+    # /record/{recid}/export/xm. MARCXML es el estandar bibliografico
+    # crudo y resulta ser la fuente mas estable para los campos que el
+    # template HTML actual ya no expone con los marcadores que esperaban
+    # las regex originales (Authors</...>, Date</...>). Concretamente
+    # usamos:
+    #     MARC 100 / 110 / 111   -> autor 'main entry' (personal /
+    #                               corporativo / congreso). Poco
+    #                               frecuentes en el catalogo de UN.
+    #     MARC 700 / 710 / 711   -> autor 'added entry'. UN cataloga
+    #                               aqui las entidades emisoras
+    #                               (Comites, Secretaria, etc.) sin
+    #                               poblar las entradas 1XX, asi que en
+    #                               la practica este es el rango que
+    #                               mas datos aporta.
+    #     MARC 245               -> titulo (no se usa aqui porque el
+    #                               <h1> del HTML lo cubre).
+    #     MARC 260$c / 264$c     -> fecha de publicacion. El subfield $c
+    #                               trae cadenas como 'Geneva : UN, 28
+    #                               Apr. 2026'; nos quedamos solo con el
+    #                               ano, alineado con UN.
+    # En todos los casos solo guardamos el subfield $a (nombre
+    # principal), descartando '(34th sess. : 2026 : Geneva)' (subfield
+    # $n) y '(DHLAUTH)94521' (subfield $0).
+    # Idioma y tipo_documento NO se sacan de MARCXML porque la nota MARC
+    # 546 aparece solo de forma esporadica (1 de cada 5 registros en las
+    # pruebas) y la inferencia actual desde nombre de PDF y titulo es
+    # del 100% y 80% respectivamente.
+
+    def _consultar_marcxml(self, recid: str) -> dict:
+        """Descarga el MARCXML de un registro y devuelve un dict con
+        los campos parseados.
+
+        Devuelve un diccionario con dos claves: 'autor' y 'fecha'. Los
+        campos no encontrados quedan en cadena vacia. Si la peticion
+        falla por cualquier motivo (red, 404, XML malformado), devuelve
+        un dict vacio sin lanzar excepcion: el caller debe tratar este
+        caso como 'sin metadatos MARCXML' y conservar lo que ya extrajo
+        del HTML.
+        """
+        url = f"{BASE_URL}/record/{recid}/export/xm"
+        try:
+            respuesta = requests.get(
+                url,
+                timeout=(10, 20),
+                headers={
+                    "User-Agent": USER_AGENT,
+                    "Accept": "application/xml,text/xml,application/marcxml+xml",
+                },
+            )
+            if respuesta.status_code != 200:
+                return {}
+            xml = respuesta.text
+        except Exception as e:
+            logger.debug(
+                f"MARCXML fallo para recid {recid}: {type(e).__name__}: {e}"
+            )
+            return {}
+
+        if not xml or "<datafield" not in xml:
+            return {}
+
+        autor = self._parsear_autor_marcxml(xml)
+        fecha = self._parsear_anio_marcxml(xml)
+        return {"autor": autor, "fecha": fecha}
+
+    def _parsear_autor_marcxml(self, xml: str) -> str:
+        """Extrae el autor desde MARC 100 / 110 / 111 / 700 / 710 / 711.
+
+        Cada datafield contiene varios subfields. El subfield 'a' es el
+        nombre principal y es lo unico que se guarda. Esto descarta
+        sufijos como sesion, fecha de congreso y el identificador
+        '(DHLAUTH)NNNN' que MARC pone en otros subfields.
+
+        En MARC21, los tags 1XX son la 'main entry' (un solo autor
+        principal) y los 7XX son 'added entries' (autores adicionales).
+        UN suele catalogar las entidades emisoras (comites, secretarias)
+        directamente en MARC 710 sin usar 110, asi que ambos rangos se
+        consideran. La prelacion conserva el sentido de MARC: primero
+        los 1XX cuando existen, luego los 7XX.
+
+        Cuando hay varios autores (varios MARC 710, por ejemplo) se
+        unen con '; ' siguiendo el mismo formato que ya usa el resto del
+        scraper para multi-autor."""
+        nombres: List[str] = []
+        for tag in ("100", "110", "111", "700", "710", "711"):
+            bloques = re.findall(
+                rf'<datafield[^>]*tag="{tag}"[^>]*>(.*?)</datafield>',
+                xml, re.DOTALL,
+            )
+            for bloque in bloques:
+                # Subfield 'a' = nombre principal. En MARCXML aparece
+                # como <subfield code="a">...</subfield>.
+                m_a = re.search(
+                    r'<subfield[^>]*code="a"[^>]*>(.*?)</subfield>',
+                    bloque, re.DOTALL,
+                )
+                if not m_a:
+                    continue
+                nombre = m_a.group(1).strip()
+                # Limpiar puntuacion final tipica de MARC: ',', '.', ';'
+                nombre = nombre.rstrip(" ,;.")
+                if nombre:
+                    nombres.append(nombre)
+
+        # Deduplicar manteniendo orden de aparicion
+        unicos = list(dict.fromkeys(nombres))
+        return "; ".join(unicos)
+
+    def _parsear_anio_marcxml(self, xml: str) -> str:
+        """Extrae el ano (4 digitos) desde MARC 260$c o 264$c.
+
+        El subfield $c trae texto libre del estilo
+        'Geneva : UN, 28 Apr. 2026' o 'New York : United Nations, 2024'.
+        Nos quedamos con el primer numero de 4 digitos que aparezca,
+        alineando el formato de fecha con el resto del scraper UN (que
+        guarda solo el ano)."""
+        for tag in ("260", "264"):
+            bloques = re.findall(
+                rf'<datafield[^>]*tag="{tag}"[^>]*>(.*?)</datafield>',
+                xml, re.DOTALL,
+            )
+            for bloque in bloques:
+                m_c = re.search(
+                    r'<subfield[^>]*code="c"[^>]*>(.*?)</subfield>',
+                    bloque, re.DOTALL,
+                )
+                if not m_c:
+                    continue
+                texto = m_c.group(1)
+                m_anio = re.search(r'\b(\d{4})\b', texto)
+                if m_anio:
+                    return m_anio.group(1)
+        return ""
+
     def _extraer_metadatos_registro(self, pagina, recid: str,
                                      filtros: FiltrosBusqueda) -> Optional[DocumentoResultado]:
         """Carga la ficha de un registro individual y extrae titulo,
@@ -550,6 +686,9 @@ class UNDigitalLibraryScraper(BaseScraper):
             doc.titulo = f"Documento UN {recid}"
 
         # --- Autores ---
+        # Las regex actuales atrapan el HTML del template antiguo de
+        # Invenio. Se conservan por si el sitio vuelve a servirlo. Si no
+        # atrapan nada, mas abajo se intenta MARCXML como fallback.
         seccion_autores = re.search(
             r'Authors\s*</[^>]+>\s*(.*?)(?:</(?:div|td|tr)|<(?:div|td|tr)\s)',
             html, re.DOTALL | re.IGNORECASE
@@ -565,6 +704,22 @@ class UNDigitalLibraryScraper(BaseScraper):
         )
         if match_fecha:
             doc.fecha = match_fecha.group(1)
+
+        # --- Fallback MARCXML para autor y fecha ---
+        # Si alguna de las regex anteriores no encontro su campo, se
+        # consulta el endpoint /record/{recid}/export/xm. La fuente
+        # MARCXML es estable y cubre estos campos en todos los recids
+        # probados; el fallback es no-op cuando el HTML ya los expone.
+        # Si la peticion MARCXML falla, _consultar_marcxml devuelve dict
+        # vacio y los campos quedan como estaban (cadena vacia, igual
+        # que el comportamiento previo a este parche).
+        if not doc.autor or not doc.fecha:
+            meta_marc = self._consultar_marcxml(recid)
+            if meta_marc:
+                if not doc.autor and meta_marc.get("autor"):
+                    doc.autor = meta_marc["autor"]
+                if not doc.fecha and meta_marc.get("fecha"):
+                    doc.fecha = meta_marc["fecha"]
 
         # --- URLs de PDFs ---
         urls_relativas = re.findall(
